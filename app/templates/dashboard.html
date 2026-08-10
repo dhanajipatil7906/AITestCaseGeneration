@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Test Agent - Dashboard</title>
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+
+<body>
+    <div class="app">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-icon">AI</div>
+                <div>
+                    <div class="brand-title">Test Agent</div>
+                    <div class="brand-subtitle">Enterprise AI</div>
+                </div>
+            </div>
+
+            <nav class="navigation">
+                <button class="nav-item active" data-tab="overview">
+                    <span>▣</span>
+                    Overview
+                </button>
+                <button class="nav-item" data-tab="analysis">
+                    <span>⌘</span>
+                    Code Analysis
+                </button>
+                <button class="nav-item" data-tab="statistics">
+                    <span>◈</span>
+                    Statistics
+                </button>
+                <button class="nav-item" data-tab="reports">
+                    <span>▤</span>
+                    Reports
+                </button>
+                <button class="nav-item" data-tab="history">
+                    <span>◷</span>
+                    History
+                </button>
+            </nav>
+
+            <div class="sidebar-bottom">
+                <div class="user-info">
+                    <div class="avatar">A</div>
+                    <div>
+                        <strong>Admin</strong>
+                        <small>Administrator</small>
+                    </div>
+                </div>
+                <button id="logoutButton" class="logout-button">Sign Out</button>
+            </div>
+        </aside>
+
+        <main class="main">
+            <header class="topbar">
+                <div>
+                    <h1>Project Dashboard</h1>
+                    <p>Load a folder, process source files, generate test cases, and review every run from one place.</p>
+                </div>
+                <div class="status">
+                    <span class="status-dot"></span>
+                    System Online
+                </div>
+            </header>
+
+            <section class="project-panel">
+                <div class="section-header">
+                    <div>
+                        <h2>Select Project Directory</h2>
+                        <p>Choose a source-code folder and let the dashboard scan the files, detect .NET controllers, and generate test cases.</p>
+                    </div>
+                </div>
+
+                <div class="project-selector">
+                    <label for="projectFolder" class="folder-input">
+                        <span class="folder-icon">📁</span>
+                        <span id="folderText">Browse project folder</span>
+                        <input type="file" id="projectFolder" webkitdirectory directory multiple />
+                    </label>
+                    <button id="analyzeButton" class="primary-button" disabled>Process Folder</button>
+                </div>
+
+                <div id="selectedFiles" class="selected-files"></div>
+                <div id="projectTypeBadge" class="project-badge">Awaiting selection</div>
+            </section>
+
+            <section id="loadingPanel" class="loading-panel hidden">
+                <div class="spinner"></div>
+                <div>
+                    <strong>Processing project...</strong>
+                    <p>Scanning source files, identifying controllers, and generating test cases.</p>
+                </div>
+            </section>
+
+            <section class="dashboard-content">
+                <div id="overview" class="tab-content active">
+                    <div class="cards">
+                        <div class="metric-card">
+                            <span class="metric-label">Total Files</span>
+                            <strong id="totalFiles" class="metric-value">0</strong>
+                            <span class="metric-description">Source files analyzed</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Lines of Code</span>
+                            <strong id="totalLines" class="metric-value">0</strong>
+                            <span class="metric-description">Total source lines</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Functions</span>
+                            <strong id="functionCount" class="metric-value">0</strong>
+                            <span class="metric-description">Detected functions/methods</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="metric-label">Classes</span>
+                            <strong id="classCount" class="metric-value">0</strong>
+                            <span class="metric-description">Detected classes</span>
+                        </div>
+                    </div>
+
+                    <div class="grid-two">
+                        <div class="panel">
+                            <h3>Analysis Summary</h3>
+                            <div id="summaryMessage" class="empty-state">Select a project and click <strong>Process Folder</strong>.</div>
+                        </div>
+                        <div class="panel">
+                            <h3>Languages</h3>
+                            <div id="languageChart" class="language-chart">
+                                <div class="empty-state">No analysis available.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="analysis" class="tab-content">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div>
+                                <h3>Code Analysis Details</h3>
+                                <p>Detailed file-by-file analysis results and generated test cases.</p>
+                            </div>
+                        </div>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>File</th>
+                                        <th>Language</th>
+                                        <th>Lines</th>
+                                        <th>Functions</th>
+                                        <th>Classes</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="fileTableBody"></tbody>
+                            </table>
+                        </div>
+                        <div class="panel-break"></div>
+                        <h4>Generated Test Cases</h4>
+                        <div id="generatedTests" class="generated-tests"></div>
+                    </div>
+                </div>
+
+                <div id="statistics" class="tab-content">
+                    <div class="panel">
+                        <h3>Code Statistics</h3>
+                        <div id="statisticsContent" class="statistics-content">
+                            <div class="empty-state">Run code analysis to see graphical statistics.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="reports" class="tab-content">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div>
+                                <h3>Analysis Reports</h3>
+                                <p>Download the latest processed analysis as Excel or JSON.</p>
+                            </div>
+                        </div>
+                        <div class="report-actions">
+                            <button id="downloadExcel" class="secondary-button">Download Excel</button>
+                            <button id="downloadJson" class="secondary-button">Download JSON</button>
+                        </div>
+                        <div id="reportSummary" class="empty-state">Run a new analysis to enable report downloads.</div>
+                    </div>
+                </div>
+
+                <div id="history" class="tab-content">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <div>
+                                <h3>Processing History</h3>
+                                <p>Review previously processed folders, files, and generated tests.</p>
+                            </div>
+                        </div>
+                        <div id="historyContent" class="history-content">
+                            <div class="empty-state">No history yet. Process a folder to start building your audit trail.</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
