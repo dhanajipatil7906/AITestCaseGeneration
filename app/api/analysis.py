@@ -91,35 +91,44 @@ def generate_test_cases_for_file(file_info: dict) -> list[str]:
         except Exception:
             pass
 
+    sample_positive = f"a valid request payload for {base_name}"
+    sample_negative = f"an invalid request with missing or malformed fields for {base_name}"
+
     if "controller" in path.lower() or language.lower() == "c#" and "controller" in name.lower():
-        test_cases = [
-            f"Ensure {base_name} returns a successful response for a valid request.",
-            f"Verify {base_name} handles invalid input gracefully and returns an appropriate error response.",
+        primary_method = method_names[0] if method_names else base_name
+        return [
+            f"Verify {primary_method} in {base_name} returns a successful response for valid input such as {sample_positive}.",
+            f"Confirm {primary_method} in {base_name} handles invalid or malformed input such as {sample_negative} and returns an appropriate error.",
+            f"Validate that {primary_method} in {base_name} processes edge-case inputs without breaking business logic.",
+            f"Create a regression test for {primary_method} in {base_name} to ensure future updates do not break current behavior.",
+            f"Confirm {primary_method} in {base_name} handles maximum valid input size correctly and returns the expected result.",
         ]
-        if method_names:
-            primary_method = method_names[0]
-            test_cases.append(
-                f"Confirm {primary_method} in {base_name} executes the expected business logic without exceptions."
-            )
-        return test_cases
 
     if method_names:
+        method = method_names[0]
         return [
-            f"Verify {method_names[0]} behaves correctly for a normal input flow.",
-            f"Confirm {method_names[0]} handles edge cases and invalid data safely.",
+            f"Verify {method} behaves correctly for normal input and returns the expected result using {sample_positive}.",
+            f"Confirm {method} handles invalid data safely and returns an appropriate error response for {sample_negative}.",
+            f"Validate that {method} remains stable with edge-case or boundary inputs.",
+            f"Create a regression test for {method} to ensure the behavior stays stable over time.",
+            f"Confirm {method} handles maximum valid input values correctly without failure.",
         ]
 
     return [
-        f"Create a functional test for {base_name} to validate the main workflow.",
-        f"Add a regression test for {base_name} to ensure the behavior remains stable.",
+        f"Create a functional test for {base_name} using representative positive input such as {sample_positive}.",
+        f"Add a negative test for {base_name} using invalid data like {sample_negative} to verify error handling.",
+        f"Validate boundary or edge-case inputs for {base_name} to ensure stability.",
+        f"Create a regression test for {base_name} to ensure future changes do not break behavior.",
+        f"Confirm {base_name} handles maximum valid input sizes and returns expected results.",
     ]
 
 
 def generate_ai_test_cases(path: str, language: str, content: str) -> list[str]:
     prompt = (
-        f"Generate 3 concise functional test case descriptions for the following {language} source file {path}:\n\n"
+        f"Generate 5 concise functional test case descriptions for the following {language} source file {path}:\n\n"
         f"{content}\n\n"
-        "Return each test case on a separate line."
+        "Include positive and negative functional scenarios, sample test input data, and one maximum valid input coverage case."
+        " Return each test case on a separate line."
     )
 
     response = requests.post(

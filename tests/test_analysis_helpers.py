@@ -25,9 +25,11 @@ class AnalysisHelpersTest(unittest.TestCase):
 
         test_cases = generate_test_cases_for_file(file_info)
 
-        self.assertGreaterEqual(len(test_cases), 2)
+        self.assertEqual(len(test_cases), 5)
         self.assertTrue(any("UsersController" in case for case in test_cases))
         self.assertTrue(any("GetUsers" in case for case in test_cases))
+        self.assertTrue(any("invalid" in case.lower() or "error" in case.lower() for case in test_cases))
+        self.assertTrue(any("maximum valid" in case.lower() or "maximum input" in case.lower() for case in test_cases))
 
     def test_get_or_create_project_falls_back_when_database_query_fails(self):
         db = Mock()
