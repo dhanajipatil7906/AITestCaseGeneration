@@ -5,16 +5,21 @@ import re
 import traceback
 import uuid
 from collections import Counter
+from types import SimpleNamespace
 from typing import Optional, Sequence, Union
 
+import requests
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from openpyxl import Workbook
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import CurrentUser, get_current_user, get_current_user_optional
+from app.config import settings
 from app.db.database import get_db
 from app.models.analysis_result import AnalysisResult
+from app.models.generated_test_case import GeneratedTestCase
 from app.models.project import Project
 
 
@@ -80,6 +85,12 @@ def generate_test_cases_for_file(file_info: dict) -> list[str]:
     method_names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", content)
     base_name = name.replace(".cs", "").replace(".py", "").replace(".js", "")
 
+    if settings.llm_api_key:
+        try:
+            return generate_ai_test_cases(path, language, content)
+        except Exception:
+            pass
+
     if "controller" in path.lower() or language.lower() == "c#" and "controller" in name.lower():
         test_cases = [
             f"Ensure {base_name} returns a successful response for a valid request.",
@@ -102,6 +113,35 @@ def generate_test_cases_for_file(file_info: dict) -> list[str]:
         f"Create a functional test for {base_name} to validate the main workflow.",
         f"Add a regression test for {base_name} to ensure the behavior remains stable.",
     ]
+
+
+def generate_ai_test_cases(path: str, language: str, content: str) -> list[str]:
+    prompt = (
+        f"Generate 3 concise functional test case descriptions for the following {language} source file {path}:\n\n"
+        f"{content}\n\n"
+        "Return each test case on a separate line."
+    )
+
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {settings.llm_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300,
+            "temperature": 0.7,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    body = response.json()
+    text = ""
+    for choice in body.get("choices", []):
+        text = choice.get("message", {}).get("content", text) or text
+    return [line.strip() for line in text.splitlines() if line.strip()][:3]
 
 
 def analyze_single_file(
@@ -243,6 +283,24 @@ def _build_analysis_summary(
     return summary
 
 
+def _ensure_generated_test_case_table(db: Session) -> None:
+    inspector = inspect(db.bind)
+    if not inspector.has_table("generated_test_cases"):
+        db.execute(text(
+            "CREATE TABLE generated_test_cases ("
+            "id UUID PRIMARY KEY, "
+            "analysis_id UUID NOT NULL, "
+            "project_id UUID NOT NULL, "
+            "file_path VARCHAR(1000) NOT NULL, "
+            "file_name VARCHAR(255) NOT NULL, "
+            "language VARCHAR(100) NOT NULL, "
+            "test_case TEXT NOT NULL, "
+            "created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL"
+            ");"
+        ))
+        db.commit()
+
+
 def _save_analysis_result(
     db: Session,
     project: Project,
@@ -252,10 +310,13 @@ def _save_analysis_result(
     total_functions: int,
     total_classes: int,
     summary: dict,
+    generated_test_cases: list[dict] | None = None,
 ) -> str:
     analysis_id = str(uuid.uuid4())
 
     try:
+        _ensure_generated_test_case_table(db)
+
         analysis_result = AnalysisResult(
             project_id=project.id,
             total_files=total_files,
@@ -270,6 +331,20 @@ def _save_analysis_result(
         db.commit()
         db.refresh(analysis_result)
         analysis_id = str(analysis_result.id)
+
+        if generated_test_cases:
+            for file_entry in generated_test_cases:
+                for test_case in file_entry.get("test_cases", []):
+                    generated_entry = GeneratedTestCase(
+                        analysis_id=analysis_result.id,
+                        project_id=project.id,
+                        file_path=file_entry.get("path", ""),
+                        file_name=file_entry.get("name", ""),
+                        language=file_entry.get("language", "Unknown"),
+                        test_case=test_case,
+                    )
+                    db.add(generated_entry)
+            db.commit()
     except Exception:
         try:
             db.rollback()
@@ -412,95 +487,100 @@ async def save_analysis_with_user(
     If the request is unauthenticated, records the role as anonymous.
     """
 
-    project = _get_or_create_project(db, project_id, project_name)
+    try:
+        project = _get_or_create_project(db, project_id, project_name)
 
-    processed_files = []
-    total_files = 0
-    total_lines = 0
-    total_functions = 0
-    total_classes = 0
-    languages = Counter()
-    generated_test_cases = []
+        processed_files = []
+        total_files = 0
+        total_lines = 0
+        total_functions = 0
+        total_classes = 0
+        languages = Counter()
+        generated_test_cases = []
 
-    for upload_file in files:
-        if not upload_file.filename:
-            continue
+        for upload_file in files:
+            if not upload_file.filename:
+                continue
 
-        raw_content = await upload_file.read()
+            raw_content = await upload_file.read()
 
-        try:
-            content = raw_content.decode("utf-8", errors="ignore")
-        except Exception:
-            continue
+            try:
+                content = raw_content.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
 
-        result = analyze_single_file(
-            file_path=upload_file.filename,
-            content=content,
-        )
+            result = analyze_single_file(
+                file_path=upload_file.filename,
+                content=content,
+            )
 
-        test_cases = generate_test_cases_for_file(
-            {
-                "path": result["path"],
-                "language": result["language"],
-                "content": content,
+            test_cases = generate_test_cases_for_file(
+                {
+                    "path": result["path"],
+                    "language": result["language"],
+                    "content": content,
+                }
+            )
+
+            processed_entry = {
+                **result,
+                "test_cases": test_cases,
             }
+            processed_files.append(processed_entry)
+            generated_test_cases.extend(test_cases)
+
+            total_files += 1
+            total_lines += result["lines"]
+            total_functions += result["functions"]
+            total_classes += result["classes"]
+            languages[result["language"]] += 1
+
+        project_type = classify_project_type(processed_files)
+
+        summary = _build_analysis_summary(
+            project=project,
+            project_type=project_type,
+            total_files=total_files,
+            total_lines=total_lines,
+            languages=languages,
+            total_functions=total_functions,
+            total_classes=total_classes,
+            processed_files=processed_files,
+            generated_test_cases=generated_test_cases,
+            current_user=current_user,
         )
 
-        processed_entry = {
-            **result,
-            "test_cases": test_cases,
+        analysis_id = _save_analysis_result(
+            db=db,
+            project=project,
+            total_files=total_files,
+            total_lines=total_lines,
+            languages=languages,
+            total_functions=total_functions,
+            total_classes=total_classes,
+            summary=summary,
+            generated_test_cases=processed_files,
+        )
+
+        return {
+            "success": True,
+            "project_id": str(project.id),
+            "project_name": project.name,
+            "project_type": project_type,
+            "analysis_id": analysis_id,
+            "total_files": total_files,
+            "total_lines": total_lines,
+            "language_count": len(languages),
+            "function_count": total_functions,
+            "class_count": total_classes,
+            "languages": dict(languages),
+            "files": processed_files,
+            "generated_test_cases": generated_test_cases,
+            "summary": summary,
         }
-        processed_files.append(processed_entry)
-        generated_test_cases.extend(test_cases)
-
-        total_files += 1
-        total_lines += result["lines"]
-        total_functions += result["functions"]
-        total_classes += result["classes"]
-        languages[result["language"]] += 1
-
-    project_type = classify_project_type(processed_files)
-
-    summary = _build_analysis_summary(
-        project=project,
-        project_type=project_type,
-        total_files=total_files,
-        total_lines=total_lines,
-        languages=languages,
-        total_functions=total_functions,
-        total_classes=total_classes,
-        processed_files=processed_files,
-        generated_test_cases=generated_test_cases,
-        current_user=current_user,
-    )
-
-    analysis_id = _save_analysis_result(
-        db=db,
-        project=project,
-        total_files=total_files,
-        total_lines=total_lines,
-        languages=languages,
-        total_functions=total_functions,
-        total_classes=total_classes,
-        summary=summary,
-    )
-
-    return {
-        "success": True,
-        "project_id": str(project.id),
-        "project_name": project.name,
-        "project_type": project_type,
-        "analysis_id": analysis_id,
-        "total_files": total_files,
-        "total_lines": total_lines,
-        "language_count": len(languages),
-        "function_count": total_functions,
-        "class_count": total_classes,
-        "languages": dict(languages),
-        "files": processed_files,
-        "generated_test_cases": generated_test_cases,
-        "summary": summary,
-    }
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.get("/history")

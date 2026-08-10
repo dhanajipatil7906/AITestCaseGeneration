@@ -82,14 +82,15 @@ function updateSelectionUi() {
     projectTypeBadge.textContent = "Ready to process";
     analyzeButton.disabled = false;
     if (saveButton) {
-        saveButton.disabled = false;
+        saveButton.disabled = selectedProjectFiles.length === 0;
     }
 }
 
 if (projectInput) {
-    projectInput.addEventListener("change", function () {
-        selectedProjectFiles = getSupportedProjectFiles(this.files);
-        selectedProjectName = deriveProjectName(this.files);
+    projectInput.addEventListener("change", function (event) {
+        const files = event.target.files || [];
+        selectedProjectFiles = getSupportedProjectFiles(files);
+        selectedProjectName = deriveProjectName(files);
         updateSelectionUi();
     });
 }
@@ -123,15 +124,20 @@ async function submitAnalysis(endpoint) {
     try {
         const response = await fetch(endpoint, {
             method: "POST",
-            headers: endpoint === "/api/analysis/analyze" ? getAuthHeaders() : getAuthHeaders(),
+            headers: getAuthHeaders(),
             body: formData,
         });
 
-        const data = await response.json().catch(() => null);
-        const errorText = await response.text().catch(() => null);
+        const text = await response.text();
+        let data = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch (e) {
+            data = null;
+        }
 
         if (!response.ok) {
-            const message = data?.detail || errorText || `Server responded with ${response.status}`;
+            const message = data?.detail || text || `Server responded with ${response.status}`;
             throw new Error(message);
         }
 
@@ -149,8 +155,9 @@ async function submitAnalysis(endpoint) {
     } finally {
         analyzeButton.disabled = false;
         if (saveButton) {
-            saveButton.disabled = false;
+            saveButton.disabled = selectedProjectFiles.length === 0;
         }
+        updateSelectionUi();
         loadingPanel.classList.add("hidden");
         loadingPanel.innerHTML = `
                 <div class="spinner"></div>
