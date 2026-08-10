@@ -2,6 +2,7 @@ const projectInput = document.getElementById("projectFolder");
 const folderText = document.getElementById("folderText");
 const selectedFiles = document.getElementById("selectedFiles");
 const analyzeButton = document.getElementById("analyzeButton");
+const saveButton = document.getElementById("saveButton");
 const loadingPanel = document.getElementById("loadingPanel");
 const projectTypeBadge = document.getElementById("projectTypeBadge");
 const downloadExcelButton = document.getElementById("downloadExcel");
@@ -54,12 +55,25 @@ function deriveProjectName(files) {
     return pathParts.length > 1 ? pathParts[0] : "Selected Project";
 }
 
+function getAuthHeaders() {
+    const accessToken = sessionStorage.getItem("access_token");
+    if (!accessToken) {
+        return {};
+    }
+    return {
+        Authorization: `Bearer ${accessToken}`,
+    };
+}
+
 function updateSelectionUi() {
     if (selectedProjectFiles.length === 0) {
         folderText.textContent = "Browse project folder";
         selectedFiles.textContent = "";
         projectTypeBadge.textContent = "Awaiting selection";
         analyzeButton.disabled = true;
+        if (saveButton) {
+            saveButton.disabled = true;
+        }
         return;
     }
 
@@ -67,6 +81,9 @@ function updateSelectionUi() {
     selectedFiles.textContent = `${selectedProjectFiles.length} supported source files selected`;
     projectTypeBadge.textContent = "Ready to process";
     analyzeButton.disabled = false;
+    if (saveButton) {
+        saveButton.disabled = false;
+    }
 }
 
 if (projectInput) {
@@ -77,62 +94,82 @@ if (projectInput) {
     });
 }
 
-if (analyzeButton) {
-    analyzeButton.addEventListener("click", async function () {
-        if (selectedProjectFiles.length === 0) {
-            alert("Please select a folder that contains source files first.");
-            return;
-        }
+async function submitAnalysis(endpoint) {
+    if (selectedProjectFiles.length === 0) {
+        alert("Please select a folder that contains source files first.");
+        return;
+    }
 
-        const formData = new FormData();
-        formData.append("project_name", selectedProjectName);
+    const formData = new FormData();
+    formData.append("project_name", selectedProjectName);
 
-        selectedProjectFiles.forEach((file) => {
-            const relativePath = file.webkitRelativePath || file.name;
-            formData.append("files", file, relativePath);
-        });
+    selectedProjectFiles.forEach((file) => {
+        const relativePath = file.webkitRelativePath || file.name;
+        formData.append("files", file, relativePath);
+    });
 
-        analyzeButton.disabled = true;
-        loadingPanel.classList.remove("hidden");
-        loadingPanel.innerHTML = `
+    analyzeButton.disabled = true;
+    if (saveButton) {
+        saveButton.disabled = true;
+    }
+    loadingPanel.classList.remove("hidden");
+    loadingPanel.innerHTML = `
             <div class="spinner"></div>
             <div>
                 <strong>Processing ${selectedProjectFiles.length} source files...</strong>
                 <p>Reading the project, detecting controllers, and generating test cases.</p>
             </div>`;
 
-        try {
-            const response = await fetch("/api/analysis/analyze", {
-                method: "POST",
-                body: formData,
-            });
+    try {
+        const response = await fetch(endpoint, {
+            method: "POST",
+            headers: endpoint === "/api/analysis/analyze" ? getAuthHeaders() : getAuthHeaders(),
+            body: formData,
+        });
 
-            const data = await response.json().catch(() => null);
+        const data = await response.json().catch(() => null);
+        const errorText = await response.text().catch(() => null);
 
-            if (!response.ok) {
-                throw new Error(data?.detail || "Code analysis failed.");
-            }
+        if (!response.ok) {
+            const message = data?.detail || errorText || `Server responded with ${response.status}`;
+            throw new Error(message);
+        }
 
-            if (!data || !data.analysis_id) {
-                throw new Error("The server did not return analysis data.");
-            }
+        if (!data || !data.analysis_id) {
+            throw new Error("The server did not return analysis data.");
+        }
 
-            latestAnalysis = data;
-            displayAnalysis(data);
-            await loadHistory();
-        } catch (error) {
-            console.error("Project analysis failed:", error);
-            alert(error.message || "Code analysis failed.");
-        } finally {
-            analyzeButton.disabled = false;
-            loadingPanel.classList.add("hidden");
-            loadingPanel.innerHTML = `
+        latestAnalysis = data;
+        displayAnalysis(data);
+        await loadHistory();
+    } catch (error) {
+        console.error("Project analysis failed:", error);
+        const message = error.message || "Code analysis failed.";
+        alert(message);
+    } finally {
+        analyzeButton.disabled = false;
+        if (saveButton) {
+            saveButton.disabled = false;
+        }
+        loadingPanel.classList.add("hidden");
+        loadingPanel.innerHTML = `
                 <div class="spinner"></div>
                 <div>
                     <strong>Processing project...</strong>
                     <p>Scanning source files, identifying controllers, and generating test cases.</p>
                 </div>`;
-        }
+    }
+}
+
+if (analyzeButton) {
+    analyzeButton.addEventListener("click", async function () {
+        await submitAnalysis("/api/analysis/analyze");
+    });
+}
+
+if (saveButton) {
+    saveButton.addEventListener("click", async function () {
+        await submitAnalysis("/api/analysis/save");
     });
 }
 
@@ -154,12 +191,15 @@ function displaySummary(analysis) {
     const element = document.getElementById("summaryMessage");
     const projectType = analysis.project_type || "generic";
     const generatedCount = Array.isArray(analysis.generated_test_cases) ? analysis.generated_test_cases.length : 0;
+    const generatedByRole = analysis.summary?.generated_by_role || analysis.generated_by_role;
+    const generatedByUsername = analysis.summary?.generated_by_username || analysis.generated_by_username;
 
     element.innerHTML = `
         <p><strong>${escapeHtml(analysis.project_name || "Imported Project")}</strong> was processed as a <strong>${escapeHtml(projectType)}</strong> project.</p>
         <p>The project contains <strong>${formatNumber(analysis.total_files || 0)}</strong> supported source files.</p>
         <p>The analyzer identified <strong>${formatNumber(analysis.function_count || 0)}</strong> functions/methods and <strong>${formatNumber(analysis.class_count || 0)}</strong> classes.</p>
         <p>Total source size: <strong>${formatNumber(analysis.total_lines || 0)}</strong> lines. Generated <strong>${formatNumber(generatedCount)}</strong> test cases.</p>
+        ${generatedByRole ? `<p>Saved with user level: <strong>${escapeHtml(generatedByRole)}</strong>${generatedByUsername ? ` by <strong>${escapeHtml(generatedByUsername)}</strong>` : ""}.</p>` : ""}
     `;
 }
 

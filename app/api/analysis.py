@@ -2,15 +2,17 @@ import io
 import json
 import os
 import re
+import traceback
 import uuid
 from collections import Counter
-from types import SimpleNamespace
+from typing import Optional, Sequence, Union
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from openpyxl import Workbook
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import CurrentUser, get_current_user, get_current_user_optional
 from app.db.database import get_db
 from app.models.analysis_result import AnalysisResult
 from app.models.project import Project
@@ -181,7 +183,7 @@ def _get_or_create_project(db: Session, project_id: str | None, project_name: st
     project_path = f"/imported/{folder_name.lower().replace(' ', '-')}"
 
     try:
-        project = db.query(Project).filter(Project.path == project_path).first()
+        project = db.query(Project).filter(Project.storage_path == project_path).first()
         if isinstance(project, Project):
             return project
     except Exception:
@@ -193,7 +195,8 @@ def _get_or_create_project(db: Session, project_id: str | None, project_name: st
     try:
         project = Project(
             name=folder_name,
-            path=project_path,
+            storage_path=project_path,
+            original_path=project_name,
         )
         db.add(project)
         db.commit()
@@ -207,6 +210,75 @@ def _get_or_create_project(db: Session, project_id: str | None, project_name: st
         return _build_project_stub(folder_name, project_path)
 
 
+def _build_analysis_summary(
+    project: Project,
+    project_type: str,
+    total_files: int,
+    total_lines: int,
+    languages: Counter,
+    total_functions: int,
+    total_classes: int,
+    processed_files: list[dict],
+    generated_test_cases: list[str],
+    current_user: CurrentUser | None = None,
+) -> dict:
+    summary = {
+        "project_name": project.name,
+        "project_type": project_type,
+        "total_files": total_files,
+        "total_lines": total_lines,
+        "language_count": len(languages),
+        "function_count": total_functions,
+        "class_count": total_classes,
+        "languages": dict(languages),
+        "files": processed_files,
+        "processed_files": processed_files,
+        "generated_test_cases": generated_test_cases,
+    }
+
+    if current_user is not None:
+        summary["generated_by_role"] = current_user.role
+        summary["generated_by_username"] = current_user.username
+
+    return summary
+
+
+def _save_analysis_result(
+    db: Session,
+    project: Project,
+    total_files: int,
+    total_lines: int,
+    languages: Counter,
+    total_functions: int,
+    total_classes: int,
+    summary: dict,
+) -> str:
+    analysis_id = str(uuid.uuid4())
+
+    try:
+        analysis_result = AnalysisResult(
+            project_id=project.id,
+            total_files=total_files,
+            total_lines=total_lines,
+            language_count=len(languages),
+            function_count=total_functions,
+            class_count=total_classes,
+            summary=summary,
+        )
+
+        db.add(analysis_result)
+        db.commit()
+        db.refresh(analysis_result)
+        analysis_id = str(analysis_result.id)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    return analysis_id
+
+
 @router.post("/analyze")
 async def analyze_code(
     project_id: str | None = Form(None),
@@ -217,6 +289,127 @@ async def analyze_code(
     """
     Analyze all source files from a selected project folder and generate
     test cases for each supported file.
+    """
+
+    try:
+        project = _get_or_create_project(db, project_id, project_name)
+
+        processed_files = []
+        total_files = 0
+        total_lines = 0
+        total_functions = 0
+        total_classes = 0
+        languages = Counter()
+        generated_test_cases = []
+
+        for upload_file in files:
+            if not upload_file.filename:
+                continue
+
+            raw_content = await upload_file.read()
+
+            try:
+                content = raw_content.decode("utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            result = analyze_single_file(
+                file_path=upload_file.filename,
+                content=content,
+            )
+
+            test_cases = generate_test_cases_for_file(
+                {
+                    "path": result["path"],
+                    "language": result["language"],
+                    "content": content,
+                }
+            )
+
+            processed_entry = {
+                **result,
+                "test_cases": test_cases,
+            }
+            processed_files.append(processed_entry)
+            generated_test_cases.extend(test_cases)
+
+            total_files += 1
+            total_lines += result["lines"]
+            total_functions += result["functions"]
+            total_classes += result["classes"]
+            languages[result["language"]] += 1
+
+        project_type = classify_project_type(processed_files)
+
+        summary = {
+            "project_name": project.name,
+            "project_type": project_type,
+            "total_files": total_files,
+            "total_lines": total_lines,
+            "language_count": len(languages),
+            "function_count": total_functions,
+            "class_count": total_classes,
+            "languages": dict(languages),
+            "files": processed_files,
+            "processed_files": processed_files,
+            "generated_test_cases": generated_test_cases,
+        }
+
+        analysis_id = str(uuid.uuid4())
+
+        try:
+            analysis_result = AnalysisResult(
+                project_id=project.id,
+                total_files=total_files,
+                total_lines=total_lines,
+                language_count=len(languages),
+                function_count=total_functions,
+                class_count=total_classes,
+                summary=summary,
+            )
+
+            db.add(analysis_result)
+            db.commit()
+            db.refresh(analysis_result)
+            analysis_id = str(analysis_result.id)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "project_id": str(project.id),
+            "project_name": project.name,
+            "project_type": project_type,
+            "analysis_id": analysis_id,
+            "total_files": total_files,
+            "total_lines": total_lines,
+            "language_count": len(languages),
+            "function_count": total_functions,
+            "class_count": total_classes,
+            "languages": dict(languages),
+            "files": processed_files,
+            "generated_test_cases": generated_test_cases,
+            "summary": summary,
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/save")
+async def save_analysis_with_user(
+    project_id: str | None = Form(None),
+    project_name: str | None = Form(None),
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: CurrentUser | None = Depends(get_current_user_optional),
+):
+    """
+    Analyze source files, generate test cases, and save the result with the current user's role.
+    If the request is unauthenticated, records the role as anonymous.
     """
 
     project = _get_or_create_project(db, project_id, project_name)
@@ -268,42 +461,29 @@ async def analyze_code(
 
     project_type = classify_project_type(processed_files)
 
-    summary = {
-        "project_name": project.name,
-        "project_type": project_type,
-        "total_files": total_files,
-        "total_lines": total_lines,
-        "language_count": len(languages),
-        "function_count": total_functions,
-        "class_count": total_classes,
-        "languages": dict(languages),
-        "files": processed_files,
-        "processed_files": processed_files,
-        "generated_test_cases": generated_test_cases,
-    }
+    summary = _build_analysis_summary(
+        project=project,
+        project_type=project_type,
+        total_files=total_files,
+        total_lines=total_lines,
+        languages=languages,
+        total_functions=total_functions,
+        total_classes=total_classes,
+        processed_files=processed_files,
+        generated_test_cases=generated_test_cases,
+        current_user=current_user,
+    )
 
-    analysis_id = str(uuid.uuid4())
-
-    try:
-        analysis_result = AnalysisResult(
-            project_id=project.id,
-            total_files=total_files,
-            total_lines=total_lines,
-            language_count=len(languages),
-            function_count=total_functions,
-            class_count=total_classes,
-            summary=summary,
-        )
-
-        db.add(analysis_result)
-        db.commit()
-        db.refresh(analysis_result)
-        analysis_id = str(analysis_result.id)
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
+    analysis_id = _save_analysis_result(
+        db=db,
+        project=project,
+        total_files=total_files,
+        total_lines=total_lines,
+        languages=languages,
+        total_functions=total_functions,
+        total_classes=total_classes,
+        summary=summary,
+    )
 
     return {
         "success": True,
