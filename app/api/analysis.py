@@ -124,11 +124,15 @@ def generate_test_cases_for_file(file_info: dict) -> list[str]:
 
 
 def generate_ai_test_cases(path: str, language: str, content: str) -> list[str]:
+    # Build a clear JSON-oriented prompt so the model returns a parsable
+    # JSON array of test-case objects. Each object should include a
+    # `description` and optional `sample_input` and `negative_case` fields.
     prompt = (
-        f"Generate 5 concise functional test case descriptions for the following {language} source file {path}:\n\n"
-        f"{content}\n\n"
-        "Include positive and negative functional scenarios, sample test input data, and one maximum valid input coverage case."
-        " Return each test case on a separate line."
+        f"You are an assistant that generates functional test cases.\n"
+        f"Given the {language} source file at path {path}, produce a JSON array of up to 5 test case objects.\n"
+        f"Each object must have a `description` (one concise sentence), and may include `sample_input` and `negative_case` strings when appropriate.\n"
+        f"Return ONLY valid JSON (an array) with no surrounding commentary.\n\n"
+        f"FILE START:\n{content}\nFILE END\n"
     )
 
     response = requests.post(
@@ -138,19 +142,63 @@ def generate_ai_test_cases(path: str, language: str, content: str) -> list[str]:
             "Content-Type": "application/json",
         },
         json={
-            "model": "gpt-4.1-mini",
+            "model": getattr(settings, "llm_model", "gpt-4.1-mini"),
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 300,
-            "temperature": 0.7,
+            "max_tokens": 600,
+            "temperature": 0.2,
         },
         timeout=30,
     )
     response.raise_for_status()
     body = response.json()
+
+    # Extract content from the model response
     text = ""
     for choice in body.get("choices", []):
-        text = choice.get("message", {}).get("content", text) or text
-    return [line.strip() for line in text.splitlines() if line.strip()][:3]
+        # support both Chat Completions and legacy fields
+        msg = choice.get("message") or choice.get("text")
+        if isinstance(msg, dict):
+            text = msg.get("content", text) or text
+        elif isinstance(msg, str):
+            text = msg or text
+
+    # Try to find and parse a JSON array inside the text
+    try:
+        # Attempt direct JSON parse
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            results = []
+            for entry in parsed[:5]:
+                if isinstance(entry, dict) and entry.get("description"):
+                    desc = entry.get("description").strip()
+                    sample = entry.get("sample_input")
+                    neg = entry.get("negative_case")
+                    combined = desc
+                    if sample:
+                        combined += f" Sample: {sample}" 
+                    if neg:
+                        combined += f" Negative: {neg}"
+                    results.append(combined)
+            if results:
+                return results
+    except Exception:
+        pass
+
+    # If JSON parse failed, fall back to line-based extraction.
+    # Remove common numbering or bullet prefixes and return up to 5 lines.
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Remove numbering like '1.' or '- ' or '•'
+        line = re.sub(r"^[\-\*\u2022\d\.\)\s]+", "", line).strip()
+        if line:
+            lines.append(line)
+        if len(lines) >= 5:
+            break
+
+    return lines[:5]
 
 
 def analyze_single_file(
