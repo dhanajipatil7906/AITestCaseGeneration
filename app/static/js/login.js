@@ -55,6 +55,7 @@ loginForm.addEventListener("submit", async (event) => {
             data.token_type
         );
 
+        document.cookie = `access_token=${encodeURIComponent(data.access_token)}; path=/; max-age=3600; SameSite=Lax`;
         window.location.href = "/dashboard";
 
     } catch (error) {

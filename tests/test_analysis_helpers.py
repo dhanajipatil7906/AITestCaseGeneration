@@ -40,6 +40,16 @@ class AnalysisHelpersTest(unittest.TestCase):
         self.assertEqual(project.name, "Fallback Project")
         self.assertTrue(project.id)
 
+    def test_get_or_create_project_uses_virtual_memory_path(self):
+        db = Mock()
+        db.get.return_value = None
+        db.query.return_value.filter.return_value.first.return_value = None
+
+        project = analysis_module._get_or_create_project(db, None, "Memory Project")
+
+        self.assertEqual(project.name, "Memory Project")
+        self.assertTrue(project.storage_path.startswith("memory://"))
+
 
 if __name__ == "__main__":
     unittest.main()

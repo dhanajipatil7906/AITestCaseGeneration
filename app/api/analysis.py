@@ -229,7 +229,7 @@ def _get_or_create_project(db: Session, project_id: str | None, project_name: st
             pass
 
     folder_name = (project_name or "Imported Project").strip() or "Imported Project"
-    project_path = f"/imported/{folder_name.lower().replace(' ', '-')}"
+    project_path = f"memory://{folder_name.lower().replace(' ', '-')}"
 
     try:
         project = db.query(Project).filter(Project.storage_path == project_path).first()

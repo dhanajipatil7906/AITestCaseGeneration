@@ -397,9 +397,14 @@ document.querySelectorAll(".nav-item").forEach((button) => {
 
 const logoutButton = document.getElementById("logoutButton");
 if (logoutButton) {
-    logoutButton.addEventListener("click", () => {
+    logoutButton.addEventListener("click", async () => {
+        await fetch("/api/auth/logout", {
+            method: "POST",
+        });
+
         sessionStorage.removeItem("access_token");
         sessionStorage.removeItem("token_type");
+        document.cookie = "access_token=; path=/; max-age=0; SameSite=Lax";
         window.location.href = "/";
     });
 }
