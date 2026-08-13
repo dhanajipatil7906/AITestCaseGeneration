@@ -7,6 +7,7 @@ const loadingPanel = document.getElementById("loadingPanel");
 const projectTypeBadge = document.getElementById("projectTypeBadge");
 const downloadExcelButton = document.getElementById("downloadExcel");
 const downloadJsonButton = document.getElementById("downloadJson");
+const llmWarningBanner = document.getElementById("llmWarningBanner");
 
 const supportedExtensions = new Set([
     ".py",
@@ -121,6 +122,10 @@ if (projectInput) {
         selectedProjectFiles = [...availableProjectFiles];
         selectedProjectName = deriveProjectName(files);
         updateSelectionUi();
+
+        if (llmWarningBanner && llmWarningBanner.classList.contains("hidden")) {
+            checkLlmStatus();
+        }
     });
 }
 
@@ -231,12 +236,44 @@ function displayAnalysis(analysis) {
     document.getElementById("functionCount").textContent = formatNumber(analysis.function_count || 0);
     document.getElementById("classCount").textContent = formatNumber(analysis.class_count || 0);
 
+    displayLlmWarning(analysis);
     displaySummary(analysis);
     displayLanguages(analysis.languages || {});
     displayFiles(analysis.files || []);
     displayGeneratedTests(analysis);
     displayStatistics(analysis);
     updateReportActions(analysis);
+}
+
+function showLlmWarningMessage(warning) {
+    if (!llmWarningBanner) {
+        return;
+    }
+
+    if (!warning) {
+        llmWarningBanner.classList.add("hidden");
+        llmWarningBanner.textContent = "";
+        return;
+    }
+
+    llmWarningBanner.textContent = `⚠ ${warning}`;
+    llmWarningBanner.classList.remove("hidden");
+}
+
+function displayLlmWarning(analysis) {
+    showLlmWarningMessage(analysis.llm_warning || analysis.summary?.llm_warning);
+}
+
+async function checkLlmStatus() {
+    try {
+        const response = await fetch("/api/analysis/llm-status", {
+            headers: getAuthHeaders(),
+        });
+        const data = await response.json();
+        showLlmWarningMessage(data.warning);
+    } catch (error) {
+        console.error("LLM status check failed:", error);
+    }
 }
 
 function displaySummary(analysis) {
@@ -475,4 +512,5 @@ if (downloadJsonButton) {
 }
 
 loadHistory();
+checkLlmStatus();
 

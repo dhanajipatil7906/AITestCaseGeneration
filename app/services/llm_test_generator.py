@@ -2,13 +2,27 @@
 import json
 import os
 import re
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
 
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError
 
 from app.config import settings
 
 
+LLM_KEY_INVALID_WARNING = "Anthropic API key is invalid or expired; test cases were generated locally."
+
 _anthropic_client: Anthropic | None = None
+_ERROR_LOG_PATH = Path(__file__).resolve().parents[2] / "anthropic_error.txt"
+
+
+def _log_anthropic_error(context: str, exc: Exception) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with open(_ERROR_LOG_PATH, "a", encoding="utf-8") as log_file:
+        log_file.write(f"[{timestamp}] {context}: {exc}\n")
+        log_file.write(traceback.format_exc())
+        log_file.write("\n")
 
 
 def _get_anthropic_client() -> Anthropic:
@@ -16,6 +30,26 @@ def _get_anthropic_client() -> Anthropic:
     if _anthropic_client is None:
         _anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
     return _anthropic_client
+
+
+def check_llm_status() -> str | None:
+    """Return a warning message if the Anthropic key is configured but invalid/expired."""
+    if not settings.anthropic_api_key:
+        return None
+
+    try:
+        _get_anthropic_client().messages.create(
+            model=settings.llm_model,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except AuthenticationError as exc:
+        _log_anthropic_error("check_llm_status", exc)
+        return LLM_KEY_INVALID_WARNING
+    except Exception as exc:
+        _log_anthropic_error("check_llm_status", exc)
+
+    return None
 
 
 def module_key_for_path(path: str) -> str:
@@ -29,13 +63,21 @@ def module_key_for_path(path: str) -> str:
     return "/".join(parts[:-1])
 
 
-def generate_module_test_cases(module_name: str, files: list[dict]) -> list[dict]:
+def generate_module_test_cases(
+    module_name: str,
+    files: list[dict],
+    warnings: list[str] | None = None,
+) -> list[dict]:
     """Return a list of {"file", "test_case"} entries for a module."""
     if settings.anthropic_api_key:
         try:
             return _generate_with_claude(module_name, files)
-        except Exception:
-            pass
+        except AuthenticationError as exc:
+            _log_anthropic_error(f"generate_module_test_cases[{module_name}]", exc)
+            if warnings is not None and LLM_KEY_INVALID_WARNING not in warnings:
+                warnings.append(LLM_KEY_INVALID_WARNING)
+        except Exception as exc:
+            _log_anthropic_error(f"generate_module_test_cases[{module_name}]", exc)
 
     return _generate_heuristic(files)
 

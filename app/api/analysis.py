@@ -19,13 +19,18 @@ from app.db.database import get_db
 from app.models.analysis_result import AnalysisResult
 from app.models.generated_test_case import GeneratedTestCase
 from app.models.project import Project
-from app.services.llm_test_generator import generate_module_test_cases, module_key_for_path
+from app.services.llm_test_generator import check_llm_status, generate_module_test_cases, module_key_for_path
 
 
 router = APIRouter(
     prefix="/api/analysis",
     tags=["analysis"],
 )
+
+
+@router.get("/llm-status")
+def get_llm_status():
+    return {"warning": check_llm_status()}
 
 
 def detect_language(filename: str) -> str:
@@ -75,7 +80,7 @@ def classify_project_type(files: list[dict]) -> str:
     return "generic"
 
 
-def _generate_test_cases_by_module(processed_files: list[dict]) -> list[dict]:
+def _generate_test_cases_by_module(processed_files: list[dict]) -> tuple[list[dict], list[str]]:
     """Group files by module, ask Claude for module-wise test cases, and
     attach the resulting test cases back onto each file entry."""
     modules: dict[str, list[dict]] = {}
@@ -83,8 +88,9 @@ def _generate_test_cases_by_module(processed_files: list[dict]) -> list[dict]:
         modules.setdefault(file_info["module"], []).append(file_info)
 
     modules_summary = []
+    llm_warnings: list[str] = []
     for module_name, module_files in modules.items():
-        module_test_cases = generate_module_test_cases(module_name, module_files)
+        module_test_cases = generate_module_test_cases(module_name, module_files, warnings=llm_warnings)
 
         test_cases_by_path: dict[str, list[str]] = {}
         for entry in module_test_cases:
@@ -101,7 +107,7 @@ def _generate_test_cases_by_module(processed_files: list[dict]) -> list[dict]:
             }
         )
 
-    return modules_summary
+    return modules_summary, llm_warnings
 
 
 
@@ -222,6 +228,7 @@ def _build_analysis_summary(
     processed_files: list[dict],
     generated_test_cases: list[str],
     modules: list[dict],
+    llm_warning: str | None = None,
     current_user: CurrentUser | None = None,
 ) -> dict:
     summary = {
@@ -237,6 +244,7 @@ def _build_analysis_summary(
         "processed_files": processed_files,
         "generated_test_cases": generated_test_cases,
         "modules": modules,
+        "llm_warning": llm_warning,
     }
 
     if current_user is not None:
@@ -368,7 +376,7 @@ async def analyze_code(
             total_classes += result["classes"]
             languages[result["language"]] += 1
 
-        modules_summary = _generate_test_cases_by_module(processed_files)
+        modules_summary, llm_warnings = _generate_test_cases_by_module(processed_files)
         generated_test_cases = [
             test_case for file_info in processed_files for test_case in file_info["test_cases"]
         ]
@@ -376,6 +384,7 @@ async def analyze_code(
             file_info.pop("content", None)
 
         project_type = classify_project_type(processed_files)
+        llm_warning = llm_warnings[0] if llm_warnings else None
 
         summary = {
             "project_name": project.name,
@@ -390,6 +399,7 @@ async def analyze_code(
             "processed_files": processed_files,
             "generated_test_cases": generated_test_cases,
             "modules": modules_summary,
+            "llm_warning": llm_warning,
         }
 
         analysis_id = str(uuid.uuid4())
@@ -430,6 +440,7 @@ async def analyze_code(
             "files": processed_files,
             "generated_test_cases": generated_test_cases,
             "modules": modules_summary,
+            "llm_warning": llm_warning,
             "summary": summary,
         }
     except Exception as exc:
@@ -489,7 +500,7 @@ async def save_analysis_with_user(
             total_classes += result["classes"]
             languages[result["language"]] += 1
 
-        modules_summary = _generate_test_cases_by_module(processed_files)
+        modules_summary, llm_warnings = _generate_test_cases_by_module(processed_files)
         generated_test_cases = [
             test_case for file_info in processed_files for test_case in file_info["test_cases"]
         ]
@@ -497,6 +508,7 @@ async def save_analysis_with_user(
             file_info.pop("content", None)
 
         project_type = classify_project_type(processed_files)
+        llm_warning = llm_warnings[0] if llm_warnings else None
 
         summary = _build_analysis_summary(
             project=project,
@@ -509,6 +521,7 @@ async def save_analysis_with_user(
             processed_files=processed_files,
             generated_test_cases=generated_test_cases,
             modules=modules_summary,
+            llm_warning=llm_warning,
             current_user=current_user,
         )
 
@@ -539,6 +552,7 @@ async def save_analysis_with_user(
             "files": processed_files,
             "generated_test_cases": generated_test_cases,
             "modules": modules_summary,
+            "llm_warning": llm_warning,
             "summary": summary,
         }
     except Exception as exc:
