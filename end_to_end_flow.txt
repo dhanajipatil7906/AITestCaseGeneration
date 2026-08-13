@@ -1,0 +1,384 @@
+================================================================================
+AI TEST AGENT - END TO END FLOW
+================================================================================
+
+This document explains, step by step, exactly what happens in the codebase
+when a user:
+
+    1. Clicks the "Sign In" button on the login page.
+    2. Selects a project folder and clicks "Process Folder" / "Generate & Save"
+       on the dashboard.
+
+--------------------------------------------------------------------------------
+PART 1: LOGIN BUTTON CLICK
+--------------------------------------------------------------------------------
+
+File involved (frontend):
+    app/static/js/login.js
+
+File involved (backend):
+    app/api/auth.py
+    app/services/auth_service.py
+    app/schemas/auth.py
+    app/main.py  (redirect target only)
+
+
+Step 1 - User submits the login form
+-------------------------------------
+- The form has id="loginForm". A "submit" event listener is attached in
+  login.js.
+- On submit:
+    - event.preventDefault() stops the normal page reload.
+    - errorMessage text is cleared.
+    - username / password values are read from the input fields.
+    - The Sign In button is disabled and its text changes to "Signing In...".
+
+
+Step 2 - Browser calls the login API
+-------------------------------------
+- login.js sends:
+      POST /api/auth/login
+      Content-Type: application/json
+      Body: { "username": "...", "password": "..." }
+
+
+Step 3 - FastAPI receives the request
+-------------------------------------
+- app/main.py registers the auth router:
+      app.include_router(auth_router)
+- The router is defined in app/api/auth.py with prefix "/api/auth".
+- The endpoint that matches is:
+      @router.post("/login", response_model=TokenResponse)
+      def login(response: Response, request: LoginRequest, db: Session = Depends(get_db)):
+
+- FastAPI validates the JSON body against the LoginRequest schema
+  (app/schemas/auth.py) - username and password must be present.
+- A SQLAlchemy DB session is injected via Depends(get_db)
+  (app/db/database.py).
+
+
+Step 4 - Authenticate the user
+-------------------------------------
+- login() calls:
+      user = authenticate_user(db=db, username=..., password=...)
+  which lives in app/services/auth_service.py.
+
+- authenticate_user():
+    - Runs: SELECT * FROM users WHERE username = :username
+    - If no user is found            -> returns None
+    - If user.is_active is False     -> returns None
+    - Calls verify_password(password, user.password_hash)
+        - This uses passlib's CryptContext (bcrypt scheme) to compare the
+          plaintext password against the stored bcrypt hash.
+    - If the password does not match -> returns None
+    - Otherwise                      -> returns the User ORM object
+
+
+Step 5 - Handle authentication failure
+-------------------------------------
+- Back in login(), if authenticate_user() returned None:
+      raise HTTPException(status_code=401, detail="Invalid username or password")
+- FastAPI turns this into a 401 JSON response:
+      { "detail": "Invalid username or password" }
+- login.js sees response.ok == false, reads data.detail, and throws an
+  Error with that message, which is caught and shown inside
+  <span id="errorMessage"> on the login page.
+
+
+Step 6 - Handle authentication success
+-------------------------------------
+- If a valid user object was returned, login() calls:
+      token = create_access_token(user_id=user.id, username=user.username, role=user.role)
+  (also in auth_service.py)
+
+- create_access_token():
+    - Builds a JWT payload:
+          {
+              "sub": "<user id>",
+              "username": "<username>",
+              "role": "<role>",
+              "exp": now + 60 minutes
+          }
+    - Signs it with jose.jwt.encode() using:
+          settings.jwt_secret     (from .env -> JWT_SECRET)
+          settings.jwt_algorithm  (from .env -> JWT_ALGORITHM, default HS256)
+    - Returns the signed JWT string.
+
+
+Step 7 - Set the auth cookie and respond
+-------------------------------------
+- login() sets an HttpOnly cookie on the response:
+      response.set_cookie(
+          key="access_token",
+          value=token,
+          httponly=True,
+          samesite="lax",
+          max_age=3600,
+          path="/",
+      )
+- login() returns:
+      { "access_token": "<jwt>", "token_type": "bearer" }
+  which FastAPI serializes according to the TokenResponse schema.
+
+
+Step 8 - Browser receives the token
+-------------------------------------
+- Back in login.js:
+    - sessionStorage.setItem("access_token", data.access_token)
+    - sessionStorage.setItem("token_type", data.token_type)
+    - A second, client-side cookie is also written manually:
+          document.cookie = "access_token=<jwt>; path=/; max-age=3600; SameSite=Lax"
+      (This is a convenience duplicate of the HttpOnly cookie already set by
+      the server in Step 7; the browser cannot read the HttpOnly one via JS,
+      so this client-side copy lets frontend JS see a token value if needed.)
+    - Finally: window.location.href = "/dashboard"
+      This triggers a full page navigation to the dashboard route.
+
+
+Step 9 - Dashboard route checks authentication
+-------------------------------------
+- The browser's GET /dashboard request automatically includes the
+  "access_token" cookie set in Step 7.
+- app/main.py handles the route:
+      @app.get("/dashboard", response_class=HTMLResponse)
+      def dashboard_page(request, current_user = Depends(get_current_user_optional)):
+
+- get_current_user_optional() (app/api/dependencies.py) looks for a token in
+  this order:
+      1. Authorization: Bearer <token> header (via HTTPBearer security)
+      2. ?token=... query string parameter
+      3. Authorization header parsed manually
+      4. "access_token" cookie
+  Whichever is found first is decoded with jose.jwt.decode() using the same
+  JWT secret/algorithm. If decoding succeeds and the payload has sub/
+  username/role, a CurrentUser object is returned; otherwise None.
+
+- If current_user is None       -> renders templates/unauthorized.html (401)
+- If current_user is present    -> renders templates/dashboard.html, passing
+                                    current_user into the template context.
+
+This completes the full login flow: button click -> API call -> DB lookup ->
+password check -> JWT creation -> cookie set -> redirect -> cookie-based
+authentication on the dashboard page.
+
+
+--------------------------------------------------------------------------------
+PART 2: SELECTING A FOLDER AND PROCESSING IT
+--------------------------------------------------------------------------------
+
+File involved (frontend):
+    app/static/js/dashboard.js
+    app/templates/dashboard.html
+
+File involved (backend):
+    app/api/analysis.py
+    app/services/llm_test_generator.py
+    app/models/analysis_result.py
+    app/models/generated_test_case.py
+    app/models/project.py
+
+
+Step 1 - User clicks the folder picker
+-------------------------------------
+- The HTML input is:
+      <input type="file" id="projectFolder" webkitdirectory directory multiple />
+  The "webkitdirectory" attribute makes the browser's native file dialog
+  select an entire folder (recursively) instead of individual files.
+
+
+Step 2 - Browser fires a "change" event
+-------------------------------------
+- dashboard.js has:
+      projectInput.addEventListener("change", function (event) {
+          const files = event.target.files || [];
+          availableProjectFiles = getSupportedProjectFiles(files);
+          selectedProjectFiles = [...availableProjectFiles];
+          selectedProjectName = deriveProjectName(files);
+          updateSelectionUi();
+
+          if (llmWarningBanner && llmWarningBanner.classList.contains("hidden")) {
+              checkLlmStatus();
+          }
+      });
+
+- getSupportedProjectFiles(files):
+    - Filters the FileList down to files whose extension is in
+      "supportedExtensions" (.py, .js, .ts, .cs, .java, .html, .css, etc).
+    - Unsupported files (images, binaries, node_modules artifacts, etc.) are
+      dropped at this stage, before anything is uploaded.
+
+- deriveProjectName(files):
+    - Reads the first file's webkitRelativePath (e.g. "MyProject/src/App.tsx")
+      and takes the first path segment ("MyProject") as the project name.
+
+- updateSelectionUi():
+    - Updates the folder label text.
+    - Calls renderFileSelection(), which builds a checkbox list (one row per
+      supported file) inside <div id="selectedFiles">. Every file is checked
+      by default.
+    - Enables/disables the "Process Folder" and "Generate & Save" buttons
+      based on whether any files are currently checked.
+
+- checkLlmStatus() (only if the warning banner is currently hidden):
+    - Calls GET /api/analysis/llm-status to proactively verify whether the
+      configured Anthropic key/credit are valid, and shows a warning banner
+      if not. (Detailed in Part 3 below.)
+
+
+Step 3 - User (optionally) unchecks some files
+-------------------------------------
+- The checkbox list has a "change" listener:
+      selectedFiles.addEventListener("change", function (event) {
+          ...
+          selectedProjectFiles = availableProjectFiles.filter(file =>
+              selectedPaths.has(getProjectFilePath(file))
+          );
+          updateSelectionUi();
+      });
+- "selectedProjectFiles" always reflects exactly what is currently checked.
+  Only these files will be uploaded and processed.
+
+
+Step 4 - User clicks "Process Folder" or "Generate & Save"
+-------------------------------------
+- Both buttons call the same function, submitAnalysis(endpoint), with a
+  different endpoint string:
+      analyzeButton -> submitAnalysis("/api/analysis/analyze")
+      saveButton    -> submitAnalysis("/api/analysis/save")
+
+- submitAnalysis():
+    - Builds a multipart FormData object:
+          formData.append("project_name", selectedProjectName)
+          for each checked file:
+              formData.append("files", file, file.webkitRelativePath)
+    - Disables both buttons and shows the loading spinner panel.
+    - Sends:
+          fetch(endpoint, {
+              method: "POST",
+              headers: getAuthHeaders(),   // Authorization: Bearer <token> if present
+              body: formData,
+          })
+    - Parses the JSON response; on success calls displayAnalysis(data) and
+      loadHistory(); on failure shows an alert() with the error message.
+
+
+Step 5 - Backend receives the upload (/api/analysis/analyze or /save)
+-------------------------------------
+Both endpoints in app/api/analysis.py follow the same pipeline:
+
+  a) _get_or_create_project(db, project_id, project_name)
+     - Looks up an existing Project row by a derived storage_path
+       ("memory://<slugified-project-name>"). Creates a new Project row if
+       none exists. Falls back to an in-memory stub object if the database
+       call fails, so analysis can still proceed without persistence.
+
+  b) For every uploaded file:
+     - Reads raw bytes: await upload_file.read()
+     - Decodes as UTF-8 (ignoring undecodable bytes).
+     - analyze_single_file(file_path, content):
+           - Detects language from the file extension (detect_language()).
+           - Counts lines, function/method definitions, and class
+             definitions using simple heuristics per language family.
+     - Adds "content" (decoded text) and "module" (module_key_for_path())
+       to the entry. module_key_for_path() groups files by their parent
+       folder, e.g. "Controllers", "src/app/login", so a .NET controller
+       and its service/model, or an Angular/React component's related
+       files, are treated as one logical module.
+     - Running totals are updated: total_files, total_lines,
+       total_functions, total_classes, and a language Counter.
+
+  c) _generate_test_cases_by_module(processed_files):
+     - Groups all processed files by their "module" key.
+     - For each module, calls generate_module_test_cases(module_name, files,
+       warnings) from app/services/llm_test_generator.py:
+           - If settings.anthropic_api_key is configured, sends ONE prompt
+             per module to Claude (via the Anthropic Python SDK) containing
+             all files in that module together, asking for a JSON array of
+             test cases (each with file, description, sample_input,
+             negative_case).
+           - Parses the JSON response and maps each test case back to the
+             correct file path.
+           - If the Claude call fails:
+                 - AuthenticationError  -> warning "Anthropic API key is
+                   invalid or expired; test cases will be generated
+                   locally."
+                 - "credit balance is too low" in the error message ->
+                   warning "Anthropic account has insufficient credit;
+                   test cases will be generated locally."
+                 - Either way, the real exception + traceback is appended
+                   to anthropic_error.txt at the project root, and the code
+                   falls back to _generate_heuristic(files), which builds
+                   deterministic template-based test cases per file
+                   (positive / negative / boundary / regression / max-input
+                   cases) without calling any LLM.
+     - Attaches the resulting test_cases list onto every file entry and
+       builds a modules_summary list (module name, files, test case count).
+     - Returns (modules_summary, llm_warnings).
+
+  d) The endpoint strips the temporary "content" field from every file
+     entry (so raw source code is not returned to the browser or persisted
+     in the summary JSON), computes project_type via
+     classify_project_type() ("dotnet" if any path/language looks like a
+     .NET controller, otherwise "generic"), and assembles a summary dict
+     containing totals, languages, files, generated_test_cases, modules,
+     and llm_warning.
+
+  e) /api/analysis/analyze:
+     - Creates and commits an AnalysisResult row (best-effort; failures are
+       caught and rolled back without failing the request).
+     - Returns the full summary + analysis_id in the JSON response.
+       This endpoint does NOT require authentication and does not persist
+       individual GeneratedTestCase rows.
+
+  f) /api/analysis/save:
+     - Requires get_current_user_optional (records the current user's role/
+       username into the summary if logged in, otherwise treated as
+       anonymous).
+     - Calls _save_analysis_result(), which:
+           - Ensures the "generated_test_cases" table exists (raw DDL,
+             created on demand if missing).
+           - Inserts the AnalysisResult row.
+           - Inserts one GeneratedTestCase row per generated test case,
+             linked to the analysis_id, project_id, file_path, file_name,
+             and language.
+     - Returns the same shape of JSON as /analyze, plus this time the data
+       is durably persisted in the database.
+
+
+Step 6 - Frontend renders the results
+-------------------------------------
+- displayAnalysis(data) in dashboard.js:
+    - Updates the metric cards (Total Files, Lines, Functions, Classes).
+    - displayLlmWarning(data): shows/hides the amber warning banner based on
+      data.llm_warning (or data.summary.llm_warning).
+    - displaySummary(), displayLanguages(), displayFiles(),
+      displayGeneratedTests(), displayStatistics(), updateReportActions()
+      populate the various dashboard tabs (Overview, Analysis, Statistics,
+      Reports, History) using the returned JSON.
+- loadHistory() then calls GET /api/analysis/history to refresh the
+  "History" tab with every previously saved AnalysisResult row.
+
+
+--------------------------------------------------------------------------------
+PART 3: PROACTIVE ANTHROPIC KEY / CREDIT CHECK
+--------------------------------------------------------------------------------
+
+- On dashboard page load, dashboard.js calls checkLlmStatus() once
+  (alongside loadHistory()).
+- checkLlmStatus() calls GET /api/analysis/llm-status, which invokes
+  check_llm_status() in app/services/llm_test_generator.py:
+      - Returns None immediately if no Anthropic key is configured.
+      - Otherwise sends a minimal 1-token "ping" message to Claude.
+      - Classifies any exception the same way as Step 5(c) above
+        (invalid/expired key vs. low credit vs. unclassified), logs the
+        real error to anthropic_error.txt, and returns the matching warning
+        string (or None if the call succeeded).
+- The dashboard shows/hides the warning banner from this result immediately,
+  even before the user selects a folder. It is checked again after folder
+  selection if the banner is not already showing a warning, so the user
+  finds out as early as possible that generation will fall back to the
+  local heuristic engine.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
