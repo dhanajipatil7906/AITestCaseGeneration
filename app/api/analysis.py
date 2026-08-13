@@ -1,14 +1,12 @@
 import io
 import json
 import os
-import re
 import traceback
 import uuid
 from collections import Counter
 from types import SimpleNamespace
 from typing import Optional, Sequence, Union
 
-import requests
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from openpyxl import Workbook
@@ -21,6 +19,7 @@ from app.db.database import get_db
 from app.models.analysis_result import AnalysisResult
 from app.models.generated_test_case import GeneratedTestCase
 from app.models.project import Project
+from app.services.llm_test_generator import generate_module_test_cases, module_key_for_path
 
 
 router = APIRouter(
@@ -76,129 +75,34 @@ def classify_project_type(files: list[dict]) -> str:
     return "generic"
 
 
-def generate_test_cases_for_file(file_info: dict) -> list[str]:
-    path = file_info.get("path") or ""
-    language = file_info.get("language") or "Unknown"
-    content = file_info.get("content") or ""
-    name = os.path.basename(path)
+def _generate_test_cases_by_module(processed_files: list[dict]) -> list[dict]:
+    """Group files by module, ask Claude for module-wise test cases, and
+    attach the resulting test cases back onto each file entry."""
+    modules: dict[str, list[dict]] = {}
+    for file_info in processed_files:
+        modules.setdefault(file_info["module"], []).append(file_info)
 
-    method_names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", content)
-    base_name = name.replace(".cs", "").replace(".py", "").replace(".js", "")
+    modules_summary = []
+    for module_name, module_files in modules.items():
+        module_test_cases = generate_module_test_cases(module_name, module_files)
 
-    if settings.llm_api_key:
-        try:
-            return generate_ai_test_cases(path, language, content)
-        except Exception:
-            pass
+        test_cases_by_path: dict[str, list[str]] = {}
+        for entry in module_test_cases:
+            test_cases_by_path.setdefault(entry["file"], []).append(entry["test_case"])
 
-    sample_positive = f"a valid request payload for {base_name}"
-    sample_negative = f"an invalid request with missing or malformed fields for {base_name}"
+        for file_info in module_files:
+            file_info["test_cases"] = test_cases_by_path.get(file_info["path"], [])
 
-    if "controller" in path.lower() or language.lower() == "c#" and "controller" in name.lower():
-        primary_method = method_names[0] if method_names else base_name
-        return [
-            f"Verify {primary_method} in {base_name} returns a successful response for valid input such as {sample_positive}.",
-            f"Confirm {primary_method} in {base_name} handles invalid or malformed input such as {sample_negative} and returns an appropriate error.",
-            f"Validate that {primary_method} in {base_name} processes edge-case inputs without breaking business logic.",
-            f"Create a regression test for {primary_method} in {base_name} to ensure future updates do not break current behavior.",
-            f"Confirm {primary_method} in {base_name} handles maximum valid input size correctly and returns the expected result.",
-        ]
+        modules_summary.append(
+            {
+                "name": module_name,
+                "files": [file_info["path"] for file_info in module_files],
+                "test_case_count": sum(len(file_info["test_cases"]) for file_info in module_files),
+            }
+        )
 
-    if method_names:
-        method = method_names[0]
-        return [
-            f"Verify {method} behaves correctly for normal input and returns the expected result using {sample_positive}.",
-            f"Confirm {method} handles invalid data safely and returns an appropriate error response for {sample_negative}.",
-            f"Validate that {method} remains stable with edge-case or boundary inputs.",
-            f"Create a regression test for {method} to ensure the behavior stays stable over time.",
-            f"Confirm {method} handles maximum valid input values correctly without failure.",
-        ]
+    return modules_summary
 
-    return [
-        f"Create a functional test for {base_name} using representative positive input such as {sample_positive}.",
-        f"Add a negative test for {base_name} using invalid data like {sample_negative} to verify error handling.",
-        f"Validate boundary or edge-case inputs for {base_name} to ensure stability.",
-        f"Create a regression test for {base_name} to ensure future changes do not break behavior.",
-        f"Confirm {base_name} handles maximum valid input sizes and returns expected results.",
-    ]
-
-
-def generate_ai_test_cases(path: str, language: str, content: str) -> list[str]:
-    # Build a clear JSON-oriented prompt so the model returns a parsable
-    # JSON array of test-case objects. Each object should include a
-    # `description` and optional `sample_input` and `negative_case` fields.
-    prompt = (
-        f"You are an assistant that generates functional test cases.\n"
-        f"Given the {language} source file at path {path}, produce a JSON array of up to 5 test case objects.\n"
-        f"Each object must have a `description` (one concise sentence), and may include `sample_input` and `negative_case` strings when appropriate.\n"
-        f"Return ONLY valid JSON (an array) with no surrounding commentary.\n\n"
-        f"FILE START:\n{content}\nFILE END\n"
-    )
-
-    response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {settings.llm_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": getattr(settings, "llm_model", "gpt-4.1-mini"),
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 600,
-            "temperature": 0.2,
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    body = response.json()
-
-    # Extract content from the model response
-    text = ""
-    for choice in body.get("choices", []):
-        # support both Chat Completions and legacy fields
-        msg = choice.get("message") or choice.get("text")
-        if isinstance(msg, dict):
-            text = msg.get("content", text) or text
-        elif isinstance(msg, str):
-            text = msg or text
-
-    # Try to find and parse a JSON array inside the text
-    try:
-        # Attempt direct JSON parse
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            results = []
-            for entry in parsed[:5]:
-                if isinstance(entry, dict) and entry.get("description"):
-                    desc = entry.get("description").strip()
-                    sample = entry.get("sample_input")
-                    neg = entry.get("negative_case")
-                    combined = desc
-                    if sample:
-                        combined += f" Sample: {sample}" 
-                    if neg:
-                        combined += f" Negative: {neg}"
-                    results.append(combined)
-            if results:
-                return results
-    except Exception:
-        pass
-
-    # If JSON parse failed, fall back to line-based extraction.
-    # Remove common numbering or bullet prefixes and return up to 5 lines.
-    lines = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        # Remove numbering like '1.' or '- ' or '•'
-        line = re.sub(r"^[\-\*\u2022\d\.\)\s]+", "", line).strip()
-        if line:
-            lines.append(line)
-        if len(lines) >= 5:
-            break
-
-    return lines[:5]
 
 
 def analyze_single_file(
@@ -317,6 +221,7 @@ def _build_analysis_summary(
     total_classes: int,
     processed_files: list[dict],
     generated_test_cases: list[str],
+    modules: list[dict],
     current_user: CurrentUser | None = None,
 ) -> dict:
     summary = {
@@ -331,6 +236,7 @@ def _build_analysis_summary(
         "files": processed_files,
         "processed_files": processed_files,
         "generated_test_cases": generated_test_cases,
+        "modules": modules,
     }
 
     if current_user is not None:
@@ -432,7 +338,6 @@ async def analyze_code(
         total_functions = 0
         total_classes = 0
         languages = Counter()
-        generated_test_cases = []
 
         for upload_file in files:
             if not upload_file.filename:
@@ -450,26 +355,25 @@ async def analyze_code(
                 content=content,
             )
 
-            test_cases = generate_test_cases_for_file(
-                {
-                    "path": result["path"],
-                    "language": result["language"],
-                    "content": content,
-                }
-            )
-
             processed_entry = {
                 **result,
-                "test_cases": test_cases,
+                "content": content,
+                "module": module_key_for_path(result["path"]),
             }
             processed_files.append(processed_entry)
-            generated_test_cases.extend(test_cases)
 
             total_files += 1
             total_lines += result["lines"]
             total_functions += result["functions"]
             total_classes += result["classes"]
             languages[result["language"]] += 1
+
+        modules_summary = _generate_test_cases_by_module(processed_files)
+        generated_test_cases = [
+            test_case for file_info in processed_files for test_case in file_info["test_cases"]
+        ]
+        for file_info in processed_files:
+            file_info.pop("content", None)
 
         project_type = classify_project_type(processed_files)
 
@@ -485,6 +389,7 @@ async def analyze_code(
             "files": processed_files,
             "processed_files": processed_files,
             "generated_test_cases": generated_test_cases,
+            "modules": modules_summary,
         }
 
         analysis_id = str(uuid.uuid4())
@@ -524,6 +429,7 @@ async def analyze_code(
             "languages": dict(languages),
             "files": processed_files,
             "generated_test_cases": generated_test_cases,
+            "modules": modules_summary,
             "summary": summary,
         }
     except Exception as exc:
@@ -553,7 +459,6 @@ async def save_analysis_with_user(
         total_functions = 0
         total_classes = 0
         languages = Counter()
-        generated_test_cases = []
 
         for upload_file in files:
             if not upload_file.filename:
@@ -571,26 +476,25 @@ async def save_analysis_with_user(
                 content=content,
             )
 
-            test_cases = generate_test_cases_for_file(
-                {
-                    "path": result["path"],
-                    "language": result["language"],
-                    "content": content,
-                }
-            )
-
             processed_entry = {
                 **result,
-                "test_cases": test_cases,
+                "content": content,
+                "module": module_key_for_path(result["path"]),
             }
             processed_files.append(processed_entry)
-            generated_test_cases.extend(test_cases)
 
             total_files += 1
             total_lines += result["lines"]
             total_functions += result["functions"]
             total_classes += result["classes"]
             languages[result["language"]] += 1
+
+        modules_summary = _generate_test_cases_by_module(processed_files)
+        generated_test_cases = [
+            test_case for file_info in processed_files for test_case in file_info["test_cases"]
+        ]
+        for file_info in processed_files:
+            file_info.pop("content", None)
 
         project_type = classify_project_type(processed_files)
 
@@ -604,6 +508,7 @@ async def save_analysis_with_user(
             total_classes=total_classes,
             processed_files=processed_files,
             generated_test_cases=generated_test_cases,
+            modules=modules_summary,
             current_user=current_user,
         )
 
@@ -633,6 +538,7 @@ async def save_analysis_with_user(
             "languages": dict(languages),
             "files": processed_files,
             "generated_test_cases": generated_test_cases,
+            "modules": modules_summary,
             "summary": summary,
         }
     except Exception as exc:

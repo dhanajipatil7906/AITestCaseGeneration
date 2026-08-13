@@ -7,7 +7,8 @@ class Settings(BaseSettings):
     jwt_secret: str
     jwt_algorithm: str = "HS256"
 
-    llm_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    llm_model: str = "claude-3-5-sonnet-20241022"
 
     model_config = SettingsConfigDict(
         env_file=".env",
