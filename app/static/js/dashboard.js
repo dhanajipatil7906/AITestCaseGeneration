@@ -32,6 +32,7 @@ const supportedExtensions = new Set([
     ".yml",
 ]);
 
+let availableProjectFiles = [];
 let selectedProjectFiles = [];
 let selectedProjectName = "Selected Project";
 let latestAnalysis = null;
@@ -55,6 +56,33 @@ function deriveProjectName(files) {
     return pathParts.length > 1 ? pathParts[0] : "Selected Project";
 }
 
+function getProjectFilePath(file) {
+    return file.webkitRelativePath || file.name;
+}
+
+function renderFileSelection() {
+    if (availableProjectFiles.length === 0) {
+        selectedFiles.textContent = "";
+        return;
+    }
+
+    const selectedPaths = new Set(selectedProjectFiles.map(getProjectFilePath));
+    selectedFiles.innerHTML = `
+        <div class="file-selection-summary">
+            ${selectedProjectFiles.length} of ${availableProjectFiles.length} supported source files selected
+        </div>
+        <div class="file-selection-list">
+            ${availableProjectFiles.map((file) => {
+                const path = getProjectFilePath(file);
+                const checked = selectedPaths.has(path) ? " checked" : "";
+                return `<label class="file-selection-item">
+                    <input type="checkbox" value="${escapeHtml(path)}"${checked}>
+                    <span>${escapeHtml(path)}</span>
+                </label>`;
+            }).join("")}
+        </div>`;
+}
+
 function getAuthHeaders() {
     const accessToken = sessionStorage.getItem("access_token");
     if (!accessToken) {
@@ -66,9 +94,9 @@ function getAuthHeaders() {
 }
 
 function updateSelectionUi() {
-    if (selectedProjectFiles.length === 0) {
+    if (availableProjectFiles.length === 0) {
         folderText.textContent = "Browse project folder";
-        selectedFiles.textContent = "";
+        renderFileSelection();
         projectTypeBadge.textContent = "Awaiting selection";
         analyzeButton.disabled = true;
         if (saveButton) {
@@ -78,9 +106,9 @@ function updateSelectionUi() {
     }
 
     folderText.textContent = selectedProjectName;
-    selectedFiles.textContent = `${selectedProjectFiles.length} supported source files selected`;
-    projectTypeBadge.textContent = "Ready to process";
-    analyzeButton.disabled = false;
+    renderFileSelection();
+    projectTypeBadge.textContent = selectedProjectFiles.length > 0 ? "Ready to process" : "Select files to process";
+    analyzeButton.disabled = selectedProjectFiles.length === 0;
     if (saveButton) {
         saveButton.disabled = selectedProjectFiles.length === 0;
     }
@@ -89,8 +117,25 @@ function updateSelectionUi() {
 if (projectInput) {
     projectInput.addEventListener("change", function (event) {
         const files = event.target.files || [];
-        selectedProjectFiles = getSupportedProjectFiles(files);
+        availableProjectFiles = getSupportedProjectFiles(files);
+        selectedProjectFiles = [...availableProjectFiles];
         selectedProjectName = deriveProjectName(files);
+        updateSelectionUi();
+    });
+}
+
+if (selectedFiles) {
+    selectedFiles.addEventListener("change", function (event) {
+        const checkbox = event.target;
+        if (!checkbox.matches('input[type="checkbox"]')) {
+            return;
+        }
+
+        const selectedPaths = new Set(
+            Array.from(selectedFiles.querySelectorAll('input[type="checkbox"]:checked'))
+                .map((input) => input.value),
+        );
+        selectedProjectFiles = availableProjectFiles.filter((file) => selectedPaths.has(getProjectFilePath(file)));
         updateSelectionUi();
     });
 }
@@ -105,7 +150,7 @@ async function submitAnalysis(endpoint) {
     formData.append("project_name", selectedProjectName);
 
     selectedProjectFiles.forEach((file) => {
-        const relativePath = file.webkitRelativePath || file.name;
+        const relativePath = getProjectFilePath(file);
         formData.append("files", file, relativePath);
     });
 

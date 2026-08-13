@@ -241,6 +241,42 @@ body {
     font-size: 13px;
 }
 
+.file-selection-summary {
+    margin-bottom: 8px;
+}
+
+.file-selection-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #f8fafc;
+}
+
+.file-selection-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 34px;
+    padding: 7px 10px;
+    border-bottom: 1px solid #e2e8f0;
+    color: #334155;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.file-selection-item:last-child {
+    border-bottom: none;
+}
+
+.file-selection-item:hover {
+    background: #eff6ff;
+}
+
+.file-selection-item input {
+    flex: 0 0 auto;
+}
+
 .project-badge {
     display: inline-block;
     margin-top: 10px;
