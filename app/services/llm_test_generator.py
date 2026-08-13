@@ -11,9 +11,11 @@ from anthropic import Anthropic, AuthenticationError
 from app.config import settings
 
 
-LLM_KEY_INVALID_WARNING = "Anthropic API key is invalid or expired; test cases were generated locally."
+LLM_KEY_INVALID_WARNING = "Anthropic API key is invalid or expired; Test cases will be generated locally."
+LLM_CREDIT_LOW_WARNING = "Anthropic account has insufficient credit; test cases will be generated locally."
 
 _anthropic_client: Anthropic | None = None
+_anthropic_client_key: str | None = None
 _ERROR_LOG_PATH = Path(__file__).resolve().parents[2] / "anthropic_error.txt"
 
 
@@ -25,15 +27,27 @@ def _log_anthropic_error(context: str, exc: Exception) -> None:
         log_file.write("\n")
 
 
+def _classify_llm_error(exc: Exception) -> str | None:
+    """Map an Anthropic exception to a user-facing warning, if applicable."""
+    if isinstance(exc, AuthenticationError):
+        return LLM_KEY_INVALID_WARNING
+    if "credit balance is too low" in str(exc).lower():
+        return LLM_CREDIT_LOW_WARNING
+    return None
+
+
 def _get_anthropic_client() -> Anthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
+    global _anthropic_client, _anthropic_client_key
+    # Recreate the client whenever the configured key changes so an edited
+    # .env is honored without needing a full process restart.
+    if _anthropic_client is None or _anthropic_client_key != settings.anthropic_api_key:
         _anthropic_client = Anthropic(api_key=settings.anthropic_api_key)
+        _anthropic_client_key = settings.anthropic_api_key
     return _anthropic_client
 
 
 def check_llm_status() -> str | None:
-    """Return a warning message if the Anthropic key is configured but invalid/expired."""
+    """Return a warning message if the Anthropic key is invalid/expired or the account is out of credit."""
     if not settings.anthropic_api_key:
         return None
 
@@ -43,11 +57,9 @@ def check_llm_status() -> str | None:
             max_tokens=1,
             messages=[{"role": "user", "content": "ping"}],
         )
-    except AuthenticationError as exc:
-        _log_anthropic_error("check_llm_status", exc)
-        return LLM_KEY_INVALID_WARNING
     except Exception as exc:
         _log_anthropic_error("check_llm_status", exc)
+        return _classify_llm_error(exc)
 
     return None
 
@@ -72,12 +84,11 @@ def generate_module_test_cases(
     if settings.anthropic_api_key:
         try:
             return _generate_with_claude(module_name, files)
-        except AuthenticationError as exc:
-            _log_anthropic_error(f"generate_module_test_cases[{module_name}]", exc)
-            if warnings is not None and LLM_KEY_INVALID_WARNING not in warnings:
-                warnings.append(LLM_KEY_INVALID_WARNING)
         except Exception as exc:
             _log_anthropic_error(f"generate_module_test_cases[{module_name}]", exc)
+            warning = _classify_llm_error(exc)
+            if warning and warnings is not None and warning not in warnings:
+                warnings.append(warning)
 
     return _generate_heuristic(files)
 
